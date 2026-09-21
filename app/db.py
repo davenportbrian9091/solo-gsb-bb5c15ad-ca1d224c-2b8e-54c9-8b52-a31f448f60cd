@@ -17,6 +17,12 @@
   幂等结果，按 ``(实验, request_id)`` 去重。
 * ``advance_batches``：批量受控揭盲的幂等结果，按 ``(实验, batch_id)``
   去重，保存首次请求绑定的有序成员列表与首次揭盲结果。
+* ``experiments.status`` / ``experiments.state_version``：实验级状态
+  （``active`` / ``paused``）与单调递增的状态版本，暂停 / 恢复通过
+  ``BEGIN IMMEDIATE`` 事务做 compare-and-set；旧库缺列时以
+  ``ALTER TABLE ... DEFAULT`` 补齐，旧实验一律按 active / 版本 0 处理。
+* ``experiment_state_events``：暂停 / 恢复的追加式审计记录，
+  按 ``(实验, operation_id)`` 唯一约束支持操作幂等重放，查询按时间倒序。
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     group_size      INTEGER NOT NULL,       -- 一组完整序列的条数
     num_subjects    INTEGER NOT NULL,
     washout_seconds INTEGER NOT NULL DEFAULT 0,  -- 周期间洗脱期（秒），旧数据按 0
+    status         TEXT NOT NULL DEFAULT 'active',  -- active | paused，旧库按 active
+    state_version  INTEGER NOT NULL DEFAULT 0,      -- 暂停 / 恢复后单调递增
     created_at      TEXT NOT NULL
 );
 
@@ -108,6 +116,19 @@ CREATE TABLE IF NOT EXISTS advance_batches (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (experiment_id, batch_id)
 );
+
+CREATE TABLE IF NOT EXISTS experiment_state_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调主键，兼作时间倒序
+    experiment_id  TEXT NOT NULL REFERENCES experiments(id),
+    operation_id   TEXT,                  -- 调用方幂等键；SQLite 唯一索引允许多个 NULL
+    action         TEXT NOT NULL,         -- pause | resume
+    from_status    TEXT NOT NULL,         -- 变更前状态（active | paused）
+    to_status      TEXT NOT NULL,         -- 变更后状态（paused | active）
+    state_version  INTEGER NOT NULL,      -- 本次变更后的状态版本
+    reason         TEXT,                  -- 暂停 / 恢复原因（可空）
+    created_at     TEXT NOT NULL,
+    UNIQUE (experiment_id, operation_id)
+);
 """
 
 
@@ -174,6 +195,44 @@ class BatchMembersRejectedError(Exception):
         super().__init__(f"batch members rejected: {len(failures)} failure(s)")
 
 
+class ExperimentPausedError(Exception):
+    """实验已暂停：暂停期间拒绝一切揭盲（单条与批量）。
+
+    冲突路径不携带任何条件 / 后续安排信息。
+    """
+
+
+class OperationIdConflictError(Exception):
+    """operation_id 已被另一个操作（不同动作 / 原因 / 期望版本）占用。"""
+
+
+class InvalidStateTransitionError(Exception):
+    """暂停 / 恢复状态转换不合法（状态不符或期望版本过期）。
+
+    :param reason: ``already_paused`` / ``already_active`` /
+        ``state_version_mismatch``。
+    :param current_status: 服务端当前状态。
+    :param state_version: 服务端当前状态版本。
+    :param expected_version: 调用方提交的期望版本（仅版本冲突时存在）。
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        current_status: str,
+        state_version: int,
+        expected_version: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.current_status = current_status
+        self.state_version = state_version
+        self.expected_version = expected_version
+        super().__init__(
+            f"invalid state transition: {reason}, status={current_status}, "
+            f"version={state_version}"
+        )
+
+
 def utc_now() -> datetime:
     """服务端当前 UTC 时刻；测试可 monkeypatch 本函数以冻结时间。"""
     return datetime.now(timezone.utc)
@@ -202,7 +261,10 @@ def init_db() -> None:
 
     * 新增表通过 ``CREATE TABLE IF NOT EXISTS`` 补齐；
     * 旧库的 ``experiments`` 表缺少 ``washout_seconds`` 列时以
-      ``ALTER TABLE ... DEFAULT 0`` 补齐，旧实验按 0 秒洗脱期处理。
+      ``ALTER TABLE ... DEFAULT 0`` 补齐，旧实验按 0 秒洗脱期处理；
+    * 旧库缺少 ``status`` / ``state_version`` 列时分别以
+      ``ALTER TABLE ... DEFAULT 'active' / 0`` 补齐，
+      旧实验一律按“运行中、版本 0”处理。
     """
     with closing(get_connection()) as conn:
         with conn:
@@ -211,6 +273,16 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE experiments "
                     "ADD COLUMN washout_seconds INTEGER NOT NULL DEFAULT 0"
+                )
+            if not _column_exists(conn, "experiments", "status"):
+                conn.execute(
+                    "ALTER TABLE experiments "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+                )
+            if not _column_exists(conn, "experiments", "state_version"):
+                conn.execute(
+                    "ALTER TABLE experiments "
+                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
                 )
 
 
@@ -228,8 +300,8 @@ def insert_experiment(
             conn.execute(
                 "INSERT INTO experiments "
                 "(id, conditions, seed, group_size, num_subjects, "
-                "washout_seconds, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "washout_seconds, status, state_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?)",
                 (
                     experiment_id,
                     json.dumps(conditions, ensure_ascii=False),
@@ -319,6 +391,24 @@ def _get_washout(conn: sqlite3.Connection, experiment_id: str) -> int | None:
     return None if row is None else int(row["washout_seconds"])
 
 
+def _get_experiment_meta(
+    conn: sqlite3.Connection, experiment_id: str
+) -> dict[str, Any] | None:
+    """读取实验的门禁相关元数据；实验不存在时返回 ``None``。"""
+    row = conn.execute(
+        "SELECT washout_seconds, status, state_version "
+        "FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "washout_seconds": int(row["washout_seconds"]),
+        "status": row["status"],
+        "state_version": int(row["state_version"]),
+    }
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -348,10 +438,15 @@ def _advance_locked(
             "_replayed": True,
         }
 
-    # 2) 实验必须存在（决定洗脱期），受试者序列必须存在（均不做下发）
-    washout = _get_washout(conn, experiment_id)
-    if washout is None:
+    # 2) 实验必须存在（决定洗脱期 / 暂停状态），受试者序列必须存在（均不做下发）
+    meta = _get_experiment_meta(conn, experiment_id)
+    if meta is None:
         return None
+    washout = meta["washout_seconds"]
+
+    # 暂停期间拒绝一切揭盲：幂等重放已在上方放行，此处不泄露任何条件
+    if meta["status"] == "paused":
+        raise ExperimentPausedError()
 
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
@@ -523,10 +618,15 @@ def _advance_batch_locked(
             "_replayed": True,
         }
 
-    # 2) 实验必须存在（决定洗脱期）
-    washout = _get_washout(conn, experiment_id)
-    if washout is None:
+    # 2) 实验必须存在（决定洗脱期 / 暂停状态）
+    meta = _get_experiment_meta(conn, experiment_id)
+    if meta is None:
         return None
+    washout = meta["washout_seconds"]
+
+    # 暂停期间整批拒绝：幂等重放已在上方放行，失败项不携带任何条件
+    if meta["status"] == "paused":
+        raise ExperimentPausedError()
 
     # 一次取齐全部成员的序列与进度（同一事务快照，期间无其他写入）
     subject_ids = [m["subject_id"] for m in members]
@@ -831,6 +931,266 @@ def _complete_locked(
     }
 
 
+def _state_event_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "experiment_id": row["experiment_id"],
+        "operation_id": row["operation_id"],
+        "action": row["action"],
+        "from_status": row["from_status"],
+        "to_status": row["to_status"],
+        "state_version": row["state_version"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+    }
+
+
+def _event_payload(row: sqlite3.Row, replayed: bool) -> dict[str, Any]:
+    """审计行转事件字典，并标记是否为幂等重放（重放只读、不重新提交）。"""
+    event = _state_event_dict(row)
+    event["_replayed"] = replayed
+    return event
+
+
+def _run_state_change(conn: sqlite3.Connection, fn: Any) -> dict[str, Any] | None:
+    """在已开启的 ``BEGIN IMMEDIATE`` 事务内执行状态变更函数并提交。
+
+    ``fn`` 返回事件字典（``_replayed`` 标记重放）；实验不存在时返回 ``None``。
+    """
+    event = fn(conn)
+    if event is None:
+        return None
+    if not event["_replayed"]:
+        conn.execute("COMMIT")
+    event.pop("_replayed", None)
+    return event
+
+
+def _transactional_state_change(fn: Any, *args: Any) -> dict[str, Any] | None:
+    """以 ``BEGIN IMMEDIATE`` 包裹一次状态变更，统一提交 / 回滚 / 关闭。"""
+    conn = get_connection()
+    committed = False
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = _run_state_change(conn, lambda c: fn(c, *args))
+            committed = True
+            return result
+        finally:
+            if not committed:
+                # 重放（只读）、409、404 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def pause_experiment(
+    experiment_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """原子暂停实验。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(实验, operation_id)`` 已存在时，仅当首条记录也是
+       “暂停且原因相同”才重放首次结果；该 operation_id 属于其他动作 /
+       原因时抛出 :class:`OperationIdConflictError`；
+    2. 状态校验：实验当前必须为 ``active``，已经是 ``paused`` 时抛出
+       :class:`InvalidStateTransitionError`（``already_paused``）；
+    3. 变更：``status`` 置为 ``paused``、``state_version`` 加一，
+       追加一条 ``experiment_state_events`` 审计记录，一起提交或回滚。
+
+    实验不存在时返回 ``None``。
+    """
+    return _transactional_state_change(
+        _pause_locked, experiment_id, operation_id, reason
+    )
+
+
+def _pause_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    event_row = conn.execute(
+        "SELECT action, reason FROM experiment_state_events "
+        "WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if event_row is not None:
+        if event_row["action"] != "pause" or event_row["reason"] != reason:
+            raise OperationIdConflictError()
+        row = conn.execute(
+            "SELECT * FROM experiment_state_events "
+            "WHERE experiment_id = ? AND operation_id = ?",
+            (experiment_id, operation_id),
+        ).fetchone()
+        return _event_payload(row, True)
+
+    row = conn.execute(
+        "SELECT status, state_version FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] == "paused":
+        raise InvalidStateTransitionError(
+            reason="already_paused",
+            current_status="paused",
+            state_version=int(row["state_version"]),
+        )
+
+    created_at = utc_now().isoformat()
+    new_version = int(row["state_version"]) + 1
+    conn.execute(
+        "UPDATE experiments SET status = 'paused', state_version = ? "
+        "WHERE id = ?",
+        (new_version, experiment_id),
+    )
+    cursor = conn.execute(
+        "INSERT INTO experiment_state_events "
+        "(experiment_id, operation_id, action, from_status, to_status, "
+        "state_version, reason, created_at) "
+        "VALUES (?, ?, 'pause', 'active', 'paused', ?, ?, ?)",
+        (experiment_id, operation_id, new_version, reason, created_at),
+    )
+    inserted = conn.execute(
+        "SELECT * FROM experiment_state_events WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _event_payload(inserted, False)
+
+
+def resume_experiment(
+    experiment_id: str,
+    expected_version: int,
+    operation_id: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """原子恢复实验（compare-and-set 状态版本）。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：携带 ``operation_id`` 且 ``(实验, operation_id)`` 已存在时，
+       仅当首条记录也是“恢复、期望版本与原因都相同”才重放首次结果；
+       不一致抛出 :class:`OperationIdConflictError`；
+    2. 原子版本校验：实验当前必须为 ``paused`` 且
+       ``state_version == expected_version``；版本不符抛出
+       :class:`InvalidStateTransitionError`（``state_version_mismatch``，
+       回传服务端当前版本与状态）；实验已在运行中则为 ``already_active``；
+    3. 变更：``status`` 置为 ``active``、``state_version`` 加一，
+       追加审计记录（恢复原因可空），一起提交或回滚。
+
+    实验不存在时返回 ``None``。
+    """
+    return _transactional_state_change(
+        _resume_locked,
+        experiment_id,
+        expected_version,
+        operation_id,
+        reason,
+    )
+
+
+def _resume_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    expected_version: int,
+    operation_id: str | None,
+    reason: str | None,
+) -> dict[str, Any] | None:
+    if operation_id is not None:
+        event_row = conn.execute(
+            "SELECT action, state_version, reason FROM experiment_state_events "
+            "WHERE experiment_id = ? AND operation_id = ?",
+            (experiment_id, operation_id),
+        ).fetchone()
+        if event_row is not None:
+            # 审计记录的 state_version 是恢复后的版本；期望版本应恰好小 1
+            if (
+                event_row["action"] != "resume"
+                or int(event_row["state_version"]) - 1 != expected_version
+                or event_row["reason"] != reason
+            ):
+                raise OperationIdConflictError()
+            row = conn.execute(
+                "SELECT * FROM experiment_state_events "
+                "WHERE experiment_id = ? AND operation_id = ?",
+                (experiment_id, operation_id),
+            ).fetchone()
+            return _event_payload(row, True)
+
+    row = conn.execute(
+        "SELECT status, state_version FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    current_status = row["status"]
+    current_version = int(row["state_version"])
+    if current_version != expected_version:
+        raise InvalidStateTransitionError(
+            reason="state_version_mismatch",
+            current_status=current_status,
+            state_version=current_version,
+            expected_version=expected_version,
+        )
+    if current_status == "active":
+        raise InvalidStateTransitionError(
+            reason="already_active",
+            current_status="active",
+            state_version=current_version,
+            expected_version=expected_version,
+        )
+
+    created_at = utc_now().isoformat()
+    new_version = current_version + 1
+    conn.execute(
+        "UPDATE experiments SET status = 'active', state_version = ? "
+        "WHERE id = ?",
+        (new_version, experiment_id),
+    )
+    cursor = conn.execute(
+        "INSERT INTO experiment_state_events "
+        "(experiment_id, operation_id, action, from_status, to_status, "
+        "state_version, reason, created_at) "
+        "VALUES (?, ?, 'resume', 'paused', 'active', ?, ?, ?)",
+        (experiment_id, operation_id, new_version, reason, created_at),
+    )
+    inserted = conn.execute(
+        "SELECT * FROM experiment_state_events WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _event_payload(inserted, False)
+
+
+def list_state_events(
+    experiment_id: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """按时间倒序（最新在前）返回实验状态变更审计记录。
+
+    实验不存在时返回 ``None``。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        # id 为自增主键，与 created_at 同序；倒序即按时间倒序
+        rows = conn.execute(
+            "SELECT * FROM experiment_state_events "
+            "WHERE experiment_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (experiment_id, limit, offset),
+        ).fetchall()
+    return [_state_event_dict(row) for row in rows]
+
+
 def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
     """查询受试者揭盲进度。
 
@@ -940,6 +1300,8 @@ def _experiment_dict(
         "num_subjects": row["num_subjects"],
         "num_periods": len(conditions),
         "washout_seconds": row["washout_seconds"],
+        "status": row["status"],
+        "state_version": row["state_version"],
         "created_at": row["created_at"],
     }
     if assignment_rows is not None:

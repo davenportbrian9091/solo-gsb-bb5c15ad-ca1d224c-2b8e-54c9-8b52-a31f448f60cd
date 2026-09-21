@@ -34,6 +34,34 @@
 - 进度查询只返回**已揭盲记录（含各自的 `completed_at`）**、`next_period` 与
   `next_available_at`（下一周期最早可推进时间），不暴露后续周期安排。
 
+## 实验级暂停 / 恢复（pause / resume）
+
+管理员可在不删除实验的情况下整体冻结揭盲流程：
+
+- **暂停** `POST /experiments/{id}/pause`：请求体携带调用方生成的唯一
+  `operation_id`（如 UUID）与必填 `reason`。服务在**单个写事务**内把
+  `status` 置为 `paused`、`state_version` 加一，并追加一条 SQLite 审计记录；
+- **恢复** `POST /experiments/{id}/resume`：请求体携带 `expected_version`
+  （调用方看到的暂停版本）。服务在写事务内做 **compare-and-set 原子校验**：
+  仅当实验当前为 `paused` 且当前版本恰好等于 `expected_version` 时才恢复；
+  版本过期（已被其他操作者变更）返回 `409 state_version_mismatch` 并回传
+  服务端当前 `state_version` / `current_status`，不会覆盖他人的状态变更；
+- **暂停期间的揭盲门禁**：单条推进与批量推进均返回
+  `409 experiment_paused`，响应体不含任何条件、周期或后续安排，且**不消耗**
+  `request_id` / `batch_id`；恢复后用原幂等键首次成功即可；
+- **已成功操作的重放不受暂停影响**：暂停前已成功揭盲的 `request_id` /
+  `batch_id`，暂停期间重试仍返回**首次结果**（重放检查先于暂停门禁）；
+- 周期**完成登记不是揭盲**，暂停期间仍可登记，便于暂停前已揭盲周期正常收尾；
+- 相同 `operation_id` 重放返回首次结果；同一 `operation_id` 绑定不同动作 /
+  原因（或恢复时绑定不同的 `expected_version`）返回 `409 operation_id_conflict`。
+  暂停与恢复共享同一个 `(实验, operation_id)` 幂等空间；
+- 每次暂停 / 恢复都追加写入 `experiment_state_events` 审计表，可通过
+  `GET /experiments/{id}/state-events` 按**时间倒序**（最新在前）分页查询，
+  支持 `limit`（1～500，默认 100）与 `offset`。
+
+实验的 `status`（`active` / `paused`）与 `state_version` 同时出现在创建、
+详情与列表接口的响应中，调用方可据此做乐观并发控制。
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -42,13 +70,45 @@ docker compose up --build
 
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
-启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲表通过 `CREATE TABLE IF NOT EXISTS`
-自动补齐，`experiments` 表新增的 `washout_seconds` 列通过幂等的
-`ALTER TABLE ... DEFAULT 0` 补齐——**旧实验一律按 0 秒洗脱期处理**，旧数据保留且可继续揭盲与登记完成。
+启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计表通过
+`CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的 `washout_seconds`、
+`status`、`state_version` 列通过幂等的 `ALTER TABLE ... DEFAULT`
+补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、状态版本 0 处理**，
+旧数据保留且可继续揭盲、登记完成、暂停与恢复。
 
 - **访问地址**：http://localhost:8000
 - **交互式 API 文档（Swagger UI）**：http://localhost:8000/docs
 - **端口**：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 中修改）
+
+### 常用 Docker 操作
+
+```bash
+# 后台运行
+docker compose up --build -d
+
+# 查看实时日志
+docker compose logs -f
+
+# 停止服务（保留数据卷）
+docker compose down
+
+# 停止并同时删除数据卷（⚠ 清空全部实验数据）
+docker compose down -v
+
+# 不使用 compose：直接构建并运行镜像
+docker build -t crossover-api .
+docker run --rm -p 8000:8000 \
+  -v "$PWD/data:/app/data" \
+  -e DATABASE_PATH=/app/data/experiments.db \
+  crossover-api
+
+# 在运行中的容器内执行测试（dev 依赖需自行安装）
+docker compose exec api sh -c "pip install --no-cache-dir pytest httpx && pytest -q"
+```
+
+健康检查：`curl http://localhost:8000/health` 应返回 `{"status":"ok"}`。
+若端口被占用，修改 `docker-compose.yml` 中 `ports` 的宿主机端口（如
+`"18000:8000"`），随后访问 http://localhost:18000 。
 
 ## 必需配置
 
@@ -92,6 +152,8 @@ curl -X POST http://localhost:8000/experiments \
   "num_subjects": 6,
   "num_periods": 3,
   "washout_seconds": 86400,
+  "status": "active",
+  "state_version": 0,
   "created_at": "…",
   "assignments": [
     {"subject_id": "s1"},
@@ -151,7 +213,10 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
 - `request_id_conflict`：相同 `request_id` 曾用于不同的 `subject_id` / `expected_period`；
 - `prior_period_not_completed`：上一周期尚无完成记录（`washout_seconds=0` 时也必须先登记完成）；
 - `washout_not_elapsed`：洗脱期尚未届满，回传
-  `retry_after_seconds`（建议等待的整秒数）；响应不携带 `next_period` 或任何条件信息。
+  `retry_after_seconds`（建议等待的整秒数）；响应不携带 `next_period` 或任何条件信息；
+- `experiment_paused`：实验已暂停。暂停期间拒绝一切揭盲，响应不含任何条件 /
+  周期信息，且不消耗 `request_id`；恢复后用原请求即可首次成功。
+  （暂停前已成功的 `request_id` 重试仍返回首次结果，不受暂停影响。）
 
 门禁判断以**服务端时间**为准并在写事务内完成，因此并发完成 / 推进串行化：
 要么完成先落盘后放行，要么推进看到“未完成 / 未到期”而 `409`，不会出现绕过门禁的揭盲。
@@ -294,17 +359,112 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/complete \
 
 实验或受试者不存在返回 `404`。
 
+### 暂停实验 `POST /experiments/{experiment_id}/pause`
+
+冻结整个实验的揭盲流程，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `operation_id` | 调用方生成的唯一操作键（如 UUID），相同操作重试必须复用 |
+| `reason` | 暂停原因（必填，非空字符串），随审计记录持久化 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/<experiment_id>/pause \
+  -H 'Content-Type: application/json' \
+  -d '{"operation_id": "5c2a…", "reason": "安全性复核，暂停全部揭盲"}'
+```
+
+成功返回 `200`，响应即本次状态变更审计记录：
+
+```json
+{
+  "id": 1,
+  "experiment_id": "…",
+  "operation_id": "5c2a…",
+  "action": "pause",
+  "from_status": "active",
+  "to_status": "paused",
+  "state_version": 1,
+  "reason": "安全性复核，暂停全部揭盲",
+  "created_at": "2026-09-21T12:00:00.000000+00:00"
+}
+```
+
+- 相同 `(实验, operation_id)` 与相同原因重试返回**首次结果**（版本不重复递增、
+  不重复写审计）；同一 `operation_id` 绑定不同原因 / 动作返回
+  `409 operation_id_conflict`；
+- 实验已经是暂停状态，换用新 `operation_id` 再暂停返回
+  `409 already_paused`（回传当前 `state_version`），且不写审计；
+- 实验不存在返回 `404`；`operation_id` / `reason` 缺失或为空返回 `422`。
+
+### 恢复实验 `POST /experiments/{experiment_id}/resume`
+
+携带期望状态版本做原子 compare-and-set 恢复，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `expected_version` | 调用方看到的暂停版本（暂停接口返回的 `state_version`，或详情接口读取） |
+| `operation_id` | 可选的唯一操作键；携带后相同操作重试返回首次结果 |
+| `reason` | 可选的恢复原因，随审计记录持久化 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/<experiment_id>/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1, "operation_id": "9d7f…", "reason": "复核通过"}'
+```
+
+仅当服务端当前状态为 `paused` 且 `state_version == expected_version` 时，
+才在单个写事务内恢复为 `active` 并把版本加一（响应结构同暂停，`action` 为
+`resume`）。冲突一律 `409`：
+
+- `state_version_mismatch`：期望版本与服务端当前版本不一致（期间可能已被
+  暂停 / 恢复多次），回传服务端当前 `state_version` 与 `current_status`，
+  调用方应重新读取状态、确认后再操作；
+- `already_active`：版本虽然匹配，但实验当前已在运行中（例如以版本 `0`
+  恢复一个从未暂停的实验）；
+- `operation_id_conflict`：`operation_id` 曾绑定其他动作 / 原因 / 期望版本。
+
+恢复后单条与批量揭盲立即恢复；暂停期间被 `409 experiment_paused` 拒绝的
+请求**未消耗幂等键**，用原 `request_id` / `batch_id` 重试即为首次成功。
+
+### 查询状态变更审计 `GET /experiments/{experiment_id}/state-events`
+
+返回暂停 / 恢复的审计记录，**按时间倒序**（最新在前），支持分页：
+
+```bash
+curl 'http://localhost:8000/experiments/<experiment_id>/state-events?limit=100&offset=0'
+```
+
+```json
+{
+  "experiment_id": "…",
+  "events": [
+    {"id": 3, "experiment_id": "…", "operation_id": "9d7f…",
+     "action": "resume", "from_status": "paused", "to_status": "active",
+     "state_version": 2, "reason": "复核通过", "created_at": "…"},
+    {"id": 2, "experiment_id": "…", "operation_id": "5c2a…",
+     "action": "pause", "from_status": "active", "to_status": "paused",
+     "state_version": 1, "reason": "安全性复核", "created_at": "…"}
+  ]
+}
+```
+
+- `limit`：1～500，默认 `100`；`offset`：分页偏移，默认 `0`；非法值返回 `422`；
+- 审计记录只增不改；从未暂停 / 恢复过的实验返回 `events: []`；
+- 实验不存在返回 `404`。
+
 ### 其他接口
 
-- `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单，**不含条件序列**；不存在返回 `404`）；
-- `GET /experiments`：列出全部实验摘要；
+- `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单 +
+  `status` / `state_version`，**不含条件序列**；不存在返回 `404`）；
+- `GET /experiments`：列出全部实验摘要（含 `status` / `state_version`）；
 - `GET /health`：健康检查。
 
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -315,8 +475,9 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共八张表，启动时幂等迁移（旧库自动补齐）：
-  - `experiments`：含 `washout_seconds`（旧库缺列时 `ALTER TABLE ... DEFAULT 0` 补齐）；
+- **存储**（`app/db.py`，SQLite）共十张表，启动时幂等迁移（旧库自动补齐）：
+  - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
+    `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
   - `subject_progress`：每受试者的 `next_period`；
   - `unblindings`：已揭盲记录（周期 → 条件，含幂等键与时间戳）；
@@ -324,10 +485,22 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   - `advance_requests` / `completion_requests`：推进与完成各自按
     `(实验, request_id)` 唯一约束保存首次结果，支持重放；
   - `advance_batches`：批量揭盲按 `(实验, batch_id)` 保存首次绑定的有序成员列表
-    与首次结果（成员或顺序不同即 `409`）。
+    与首次结果（成员或顺序不同即 `409`）；
+  - `experiment_state_events`：暂停 / 恢复的追加式审计记录（自增 `id`、
+    `action`、前后状态、`state_version`、原因、时间戳），按
+    `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序。
+- **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
+  “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
+  恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
+  并发恢复只有一个赢家；暂停门禁同样在揭盲写事务内判定，与暂停 / 恢复互斥：
+  事务提交后的揭盲必看到 `paused` 而拒绝，不会出现暂停后仍漏出条件。
 - **原子推进与完成门禁**：推进、完成与批量推进都在单个 `BEGIN IMMEDIATE` 事务内完成
   “幂等检查 → 顺序 / 周期校验 → 写入并提交”，配合 `busy_timeout` 让并发请求串行化：
   每个周期只有一个完成请求、一次推进成功，其余得到 `409`；推进时**服务端时间在锁内读取**，
   与并发的完成登记互斥，`completed_at + washout_seconds` 的判断与揭盲写入原子一致；
   批量推进在同一事务内**先统一校验全部成员、再按输入顺序写入**，任何失败路径整体回滚，
   不会绕过门禁、部分揭盲或多揭露条件。
+- **暂停期揭盲门禁与幂等重放的顺序**：单条推进与批量推进都**先做幂等命中检查**，
+  已成功操作的重放即使在暂停期间也直接返回首次结果（只读，不重新推进）；
+  未命中的新请求再经过暂停门禁，得到不含任何条件信息的 `409 experiment_paused`，
+  且不写入幂等记录，恢复后原键仍可首次成功。

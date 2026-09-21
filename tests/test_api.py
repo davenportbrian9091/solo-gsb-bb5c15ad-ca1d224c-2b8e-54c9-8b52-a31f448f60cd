@@ -1492,3 +1492,586 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         )
         assert second.status_code == 200
         assert second.json()["condition"] == "C"
+
+
+# ---------- 实验级暂停 / 恢复 ----------
+
+def pause_experiment(
+    client: TestClient,
+    experiment_id: str,
+    operation_id: str,
+    reason: str = "suspension review",
+):
+    return client.post(
+        f"/experiments/{experiment_id}/pause",
+        json={"operation_id": operation_id, "reason": reason},
+    )
+
+
+def resume_experiment(
+    client: TestClient,
+    experiment_id: str,
+    expected_version: int,
+    operation_id: str | None = None,
+    reason: str | None = None,
+):
+    body: dict = {"expected_version": expected_version}
+    if operation_id is not None:
+        body["operation_id"] = operation_id
+    if reason is not None:
+        body["reason"] = reason
+    return client.post(
+        f"/experiments/{experiment_id}/resume", json=body
+    )
+
+
+def test_new_experiment_is_active_at_version_zero(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    assert body["status"] == "active"
+    assert body["state_version"] == 0
+
+    detail = client.get(f"/experiments/{body['experiment_id']}").json()
+    assert detail["status"] == "active"
+    assert detail["state_version"] == 0
+    entry = next(
+        e for e in client.get("/experiments").json()
+        if e["experiment_id"] == body["experiment_id"]
+    )
+    assert entry["status"] == "active"
+    assert entry["state_version"] == 0
+    assert_no_sequence_leak(detail)
+
+
+def test_pause_and_resume_lifecycle(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    paused = pause_experiment(client, eid, "op-pause-1", "safety hold")
+    assert paused.status_code == 200, paused.text
+    event = paused.json()
+    assert event["action"] == "pause"
+    assert event["from_status"] == "active"
+    assert event["to_status"] == "paused"
+    assert event["state_version"] == 1
+    assert event["operation_id"] == "op-pause-1"
+    assert event["reason"] == "safety hold"
+    assert "created_at" in event
+    assert "id" in event
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["status"] == "paused"
+    assert detail["state_version"] == 1
+
+    # 期望版本过期：compare-and-set 失败并回传服务端当前版本与状态
+    stale = resume_experiment(client, eid, expected_version=0)
+    assert stale.status_code == 409
+    stale_detail = stale.json()["detail"]
+    assert stale_detail["reason"] == "state_version_mismatch"
+    assert stale_detail["state_version"] == 1
+    assert stale_detail["current_status"] == "paused"
+    assert stale_detail["expected_version"] == 0
+    # 版本冲突不改变状态、不产生审计记录
+    assert client.get(f"/experiments/{eid}").json()["status"] == "paused"
+
+    resumed = resume_experiment(
+        client, eid, expected_version=1, operation_id="op-resume-1",
+        reason="review finished",
+    )
+    assert resumed.status_code == 200, resumed.text
+    resume_event = resumed.json()
+    assert resume_event["action"] == "resume"
+    assert resume_event["from_status"] == "paused"
+    assert resume_event["to_status"] == "active"
+    assert resume_event["state_version"] == 2
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["status"] == "active"
+    assert detail["state_version"] == 2
+
+    # 恢复后揭盲恢复正常
+    ok = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert ok.status_code == 200
+
+
+def test_pause_is_idempotent_per_operation_id(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    payload = {"operation_id": "op-idem", "reason": "same reason"}
+
+    first = client.post(f"/experiments/{eid}/pause", json=payload)
+    assert first.status_code == 200
+    for _ in range(3):
+        replay = client.post(f"/experiments/{eid}/pause", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+
+    # 重放不重复递增版本、不产生额外审计记录
+    assert client.get(f"/experiments/{eid}").json()["state_version"] == 1
+    events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+    assert len(events) == 1
+
+
+def test_repeated_pause_with_new_operation_returns_409(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "op-1").status_code == 200
+
+    again = pause_experiment(client, eid, "op-2", "different hold")
+    assert again.status_code == 409
+    detail = again.json()["detail"]
+    assert detail["reason"] == "already_paused"
+    assert detail["state_version"] == 1
+    assert detail["current_status"] == "paused"
+    # 失败路径不写入审计记录
+    events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+    assert [e["operation_id"] for e in events] == ["op-1"]
+
+
+def test_pause_operation_id_conflicts_on_different_reason(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    first = pause_experiment(client, eid, "shared-op", "first reason")
+    assert first.status_code == 200
+
+    conflict = client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "shared-op", "reason": "different reason"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+    assert conflict.json()["detail"]["operation_id"] == "shared-op"
+
+
+def test_operation_id_namespace_is_shared_between_pause_and_resume(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "shared-op").status_code == 200
+
+    # 暂停的 operation_id 不能用于恢复
+    conflict = resume_experiment(client, eid, 1, operation_id="shared-op")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+
+    # 冲突不改变状态：正确版本恢复仍成功
+    ok = resume_experiment(client, eid, 1, operation_id="resume-op")
+    assert ok.status_code == 200
+
+    # 恢复的 operation_id 也不能复用于再次暂停
+    reused = pause_experiment(client, eid, "resume-op")
+    assert reused.status_code == 409
+    assert reused.json()["detail"]["reason"] == "operation_id_conflict"
+
+
+def test_advance_and_batch_return_409_while_paused_without_leak(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    advance = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert advance.status_code == 409
+    detail = advance.json()["detail"]
+    assert detail["reason"] == "experiment_paused"
+    # 不泄露任何条件 / 后续安排
+    assert "condition" not in detail
+    assert "next_period" not in detail
+    assert_no_sequence_leak(detail)
+
+    batch = advance_batch(
+        client,
+        eid,
+        [
+            {"subject_id": "s1", "expected_period": 1},
+            {"subject_id": "s2", "expected_period": 1},
+        ],
+        "b1",
+    )
+    assert batch.status_code == 409
+    batch_detail = batch.json()["detail"]
+    assert batch_detail["reason"] == "experiment_paused"
+    assert "failures" not in batch_detail
+    assert_no_sequence_leak(batch_detail)
+
+    # 暂停期间零揭盲、零幂等消耗
+    for subject_id in ("s1", "s2"):
+        progress = client.get(
+            f"/experiments/{eid}/subjects/{subject_id}/progress"
+        ).json()
+        assert progress["next_period"] == 1
+        assert progress["reveals"] == []
+
+    # 恢复后原 request_id / batch_id 均为首次成功（暂停 409 不消耗幂等键）
+    assert resume_experiment(client, eid, 1).status_code == 200
+    ok = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert ok.status_code == 200
+    ok_batch = advance_batch(
+        client, eid, [{"subject_id": "s2", "expected_period": 1}], "b1"
+    )
+    assert ok_batch.status_code == 200
+
+
+def test_successful_unblinding_replays_first_result_during_pause(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    first = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+
+    first_batch = advance_batch(
+        client, eid, [{"subject_id": "s2", "expected_period": 1}], "b1"
+    )
+    assert first_batch.status_code == 200
+    first_batch_body = first_batch.json()
+
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    # 已有幂等成功的重放仍返回首次结果，不受暂停影响
+    replay = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+
+    batch_replay = advance_batch(
+        client, eid, [{"subject_id": "s2", "expected_period": 1}], "b1"
+    )
+    assert batch_replay.status_code == 200
+    assert batch_replay.json() == first_batch_body
+
+    # 重放不产生新的揭盲记录
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert len(progress["reveals"]) == 1
+
+
+def test_completion_remains_allowed_while_paused(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    # 完成登记不是揭盲，暂停期间仍允许
+    done = complete_period(client, eid, "s1", 1, "c1")
+    assert done.status_code == 200
+
+    # 但下一周期揭盲仍被门禁拦截
+    blocked = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+
+def test_resume_when_already_active_returns_409(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    # 运行中以版本 0 恢复：状态已是 active
+    resp = resume_experiment(client, eid, 0)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "already_active"
+    assert detail["state_version"] == 0
+    assert detail["current_status"] == "active"
+    assert client.get(f"/experiments/{eid}").json()["state_version"] == 0
+
+
+def test_resume_with_operation_id_is_idempotent(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "p1").status_code == 200
+
+    payload = {"expected_version": 1, "operation_id": "r1", "reason": "ok"}
+    first = client.post(f"/experiments/{eid}/resume", json=payload)
+    assert first.status_code == 200
+    # 恢复后（active, v2）重放仍返回首次结果，而非 409
+    for _ in range(3):
+        replay = client.post(f"/experiments/{eid}/resume", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+    assert client.get(f"/experiments/{eid}").json()["state_version"] == 2
+
+    # 相同 operation_id 但期望版本不同 → 冲突
+    diff = client.post(
+        f"/experiments/{eid}/resume",
+        json={"expected_version": 2, "operation_id": "r1"},
+    )
+    assert diff.status_code == 409
+    assert diff.json()["detail"]["reason"] == "operation_id_conflict"
+
+
+def test_state_events_listed_in_reverse_chronological_order(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    assert pause_experiment(client, eid, "p1", "hold-1").status_code == 200
+    assert resume_experiment(client, eid, 1, "r1").status_code == 200
+    assert pause_experiment(client, eid, "p2", "hold-2").status_code == 200
+
+    resp = client.get(f"/experiments/{eid}/state-events")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["experiment_id"] == eid
+    events = payload["events"]
+    # 最新在前（按时间倒序）
+    assert [(e["action"], e["state_version"], e["reason"]) for e in events] == [
+        ("pause", 3, "hold-2"),
+        ("resume", 2, None),
+        ("pause", 1, "hold-1"),
+    ]
+    assert all("created_at" in e for e in events)
+    assert events[0]["id"] > events[1]["id"] > events[2]["id"]
+    assert_no_sequence_leak(payload)
+
+    # limit / offset 分页
+    page1 = client.get(f"/experiments/{eid}/state-events?limit=2").json()["events"]
+    assert [e["operation_id"] for e in page1] == ["p2", "r1"]
+    page2 = client.get(
+        f"/experiments/{eid}/state-events?limit=2&offset=2"
+    ).json()["events"]
+    assert [e["operation_id"] for e in page2] == ["p1"]
+
+    # 非法分页参数
+    assert client.get(
+        f"/experiments/{eid}/state-events?limit=0"
+    ).status_code == 422
+    assert client.get(
+        f"/experiments/{eid}/state-events?limit=501"
+    ).status_code == 422
+    assert client.get(
+        f"/experiments/{eid}/state-events?offset=-1"
+    ).status_code == 422
+
+    # 没有任何状态变更的实验返回空列表
+    fresh, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["t1", "t2"],
+        seed=2,
+    )
+    empty = client.get(
+        f"/experiments/{fresh['experiment_id']}/state-events"
+    ).json()
+    assert empty["events"] == []
+
+
+def test_pause_resume_payload_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "", "reason": "x"},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "p", "reason": ""},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/pause", json={"operation_id": "p"}
+    ).status_code == 422
+
+    # 恢复：expected_version 必填且非负
+    assert client.post(
+        f"/experiments/{eid}/resume", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/resume", json={"expected_version": -1}
+    ).status_code == 422
+    # 空字符串的 operation_id / reason 不合法
+    assert client.post(
+        f"/experiments/{eid}/resume",
+        json={"expected_version": 0, "operation_id": ""},
+    ).status_code == 422
+
+
+def test_pause_resume_events_unknown_experiment_return_404(
+    client: TestClient,
+) -> None:
+    assert client.post(
+        "/experiments/missing/pause",
+        json={"operation_id": "p", "reason": "x"},
+    ).status_code == 404
+    assert client.post(
+        "/experiments/missing/resume", json={"expected_version": 1}
+    ).status_code == 404
+    assert client.get(
+        "/experiments/missing/state-events"
+    ).status_code == 404
+
+
+def test_concurrent_resume_has_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-resume.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 31,
+            },
+        ).json()
+        eid = created["experiment_id"]
+        assert setup.post(
+            f"/experiments/{eid}/pause",
+            json={"operation_id": "p1", "reason": "hold"},
+        ).status_code == 200
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/resume",
+                json={"expected_version": 1, "operation_id": f"r-{i}"},
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE + 版本 compare-and-set：只有一次恢复成功
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+
+    with TestClient(app) as verify:
+        detail = verify.get(f"/experiments/{eid}").json()
+        assert detail["status"] == "active"
+        assert detail["state_version"] == 2
+        events = verify.get(f"/experiments/{eid}/state-events").json()["events"]
+    # 只有 pause + 一次 resume 两条审计记录
+    assert [(e["action"], e["state_version"]) for e in events] == [
+        ("resume", 2),
+        ("pause", 1),
+    ]
+
+
+def test_legacy_database_defaults_to_active_version_zero(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-pause.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-pause", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-pause", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-pause", "s2", 1, '["B","A"]'),
+        )
+
+    with TestClient(app) as migrated:
+        detail = migrated.get("/experiments/legacy-pause").json()
+        # 旧实验迁移后按“运行中、版本 0”处理
+        assert detail["status"] == "active"
+        assert detail["state_version"] == 0
+
+        # 暂停 / 恢复完整链路在迁移库上可用
+        assert migrated.post(
+            "/experiments/legacy-pause/pause",
+            json={"operation_id": "p1", "reason": "hold legacy"},
+        ).status_code == 200
+        blocked = migrated.post(
+            "/experiments/legacy-pause/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+        assert migrated.post(
+            "/experiments/legacy-pause/resume",
+            json={"expected_version": 1},
+        ).status_code == 200
+        assert migrated.post(
+            "/experiments/legacy-pause/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        ).status_code == 200

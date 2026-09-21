@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -39,6 +41,8 @@ class ExperimentOut(BaseModel):
     num_subjects: int
     num_periods: int
     washout_seconds: int
+    status: Literal["active", "paused"]
+    state_version: int
     created_at: str
     assignments: list[AssignmentOut]
 
@@ -51,6 +55,8 @@ class ExperimentSummary(BaseModel):
     num_subjects: int
     num_periods: int
     washout_seconds: int
+    status: Literal["active", "paused"]
+    state_version: int
     created_at: str
 
 
@@ -169,3 +175,60 @@ class ProgressOut(BaseModel):
     completed: bool
     next_available_at: str | None = None
     reveals: list[RevealOut]
+
+
+class PauseRequest(BaseModel):
+    """暂停实验请求：携带唯一 operation_id 与暂停原因。"""
+
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本次暂停的唯一操作键（如 UUID），相同操作重试必须复用",
+    )
+    reason: str = Field(
+        ..., min_length=1, description="暂停原因（必填），随审计记录持久化"
+    )
+
+
+class ResumeRequest(BaseModel):
+    """恢复实验请求：携带期望状态版本做原子 compare-and-set。"""
+
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "调用方看到的暂停状态版本；服务端仅在当前版本与之相等且实验已暂停时"
+            "才原子恢复，否则 409 并回传当前版本"
+        ),
+    )
+    operation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="可选的唯一操作键；携带时相同操作重试返回首次结果",
+    )
+    reason: str | None = Field(
+        default=None,
+        min_length=1,
+        description="可选的恢复原因，随审计记录持久化",
+    )
+
+
+class StateEventOut(BaseModel):
+    """一条实验状态变更审计记录。"""
+
+    id: int
+    experiment_id: str
+    operation_id: str | None = None
+    action: Literal["pause", "resume"]
+    from_status: Literal["active", "paused"]
+    to_status: Literal["active", "paused"]
+    state_version: int
+    reason: str | None = None
+    created_at: str
+
+
+class StateEventsOut(BaseModel):
+    """状态变更审计列表，按时间倒序（最新在前）。"""
+
+    experiment_id: str
+    events: list[StateEventOut]
