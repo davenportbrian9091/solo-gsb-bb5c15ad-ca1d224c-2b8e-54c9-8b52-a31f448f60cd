@@ -1492,3 +1492,543 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         )
         assert second.status_code == 200
         assert second.json()["condition"] == "C"
+
+
+# ---------- 实验级暂停 / 恢复 ----------
+
+def pause_experiment(
+    client: TestClient,
+    experiment_id: str,
+    operation_id: str,
+    reason: str,
+):
+    return client.post(
+        f"/experiments/{experiment_id}/pause",
+        json={"operation_id": operation_id, "reason": reason},
+    )
+
+
+def resume_experiment(
+    client: TestClient,
+    experiment_id: str,
+    operation_id: str,
+    expected_version: int,
+):
+    return client.post(
+        f"/experiments/{experiment_id}/resume",
+        json={
+            "operation_id": operation_id,
+            "expected_version": expected_version,
+        },
+    )
+
+
+def test_pause_then_resume_transitions_state_and_versions(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    paused = pause_experiment(client, eid, "op-pause-1", "中期安全审查")
+    assert paused.status_code == 200, paused.text
+    paused_body = paused.json()
+    assert paused_body["status"] == "paused"
+    assert paused_body["version"] == 2
+    assert paused_body["operation_id"] == "op-pause-1"
+    assert paused_body["reason"] == "中期安全审查"
+    assert "changed_at" in paused_body
+
+    # 已暂停再暂停 -> 409，回传当前状态与版本，不改变状态
+    again = pause_experiment(client, eid, "op-pause-2", "再次暂停")
+    assert again.status_code == 409
+    detail = again.json()["detail"]
+    assert detail["reason"] == "already_paused"
+    assert detail["status"] == "paused"
+    assert detail["version"] == 2
+    assert "condition" not in detail
+
+    # 版本正确的恢复成功，版本继续递增
+    resumed = resume_experiment(client, eid, "op-resume-1", expected_version=2)
+    assert resumed.status_code == 200, resumed.text
+    resumed_body = resumed.json()
+    assert resumed_body["status"] == "active"
+    assert resumed_body["version"] == 3
+    assert resumed_body["operation_id"] == "op-resume-1"
+    assert resumed_body["reason"] is None
+
+    # 活动状态再次恢复 -> 409 not_paused
+    second_resume = resume_experiment(
+        client, eid, "op-resume-2", expected_version=3
+    )
+    assert second_resume.status_code == 409
+    detail = second_resume.json()["detail"]
+    assert detail["reason"] == "not_paused"
+    assert detail["status"] == "active"
+    assert detail["version"] == 3
+
+
+def test_paused_single_and_batch_advance_return_409_without_leak(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    # 先有一条成功揭盲（用于验证暂停只挡新揭盲、不挡重放）
+    first = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "r1"},
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+
+    assert pause_experiment(client, eid, "pause-1", "暂停").status_code == 200
+
+    # 单条新揭盲 -> 409，且不泄露任何周期 / 条件 / 进度信息
+    blocked = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s2", "expected_period": 1, "request_id": "r2"},
+    )
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert detail["reason"] == "experiment_paused"
+    assert "condition" not in detail
+    assert "next_period" not in detail
+    assert_no_sequence_leak(detail)
+
+    # 暂停前的成功请求重放 -> 仍返回首次结果（暂停不影响幂等成功重放）
+    replay = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "r1"},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+
+    # 批量新揭盲 -> 409 experiment_paused
+    batch = client.post(
+        f"/experiments/{eid}/advance-batch",
+        json={
+            "batch_id": "b1",
+            "members": [{"subject_id": "s2", "expected_period": 1}],
+        },
+    )
+    assert batch.status_code == 409
+    assert batch.json()["detail"]["reason"] == "experiment_paused"
+    assert_no_sequence_leak(batch.json())
+
+    # 完成登记不受暂停影响：暂停期间仍可登记已揭盲周期的完成
+    done = complete_period(client, eid, "s1", 1, "c1")
+    assert done.status_code == 200
+
+    # 暂停期间没有任何新揭盲 / 推进
+    progress_s2 = client.get(f"/experiments/{eid}/subjects/s2/progress").json()
+    assert progress_s2["reveals"] == []
+    assert progress_s2["next_period"] == 1
+
+    # 恢复后新揭盲立即放行
+    assert resume_experiment(client, eid, "resume-1", expected_version=2).status_code == 200
+    ok = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s2", "expected_period": 1, "request_id": "r2"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["period"] == 1
+
+    # s1 已完成周期 1，恢复后可直接推进周期 2
+    ok2 = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "r3"},
+    )
+    assert ok2.status_code == 200
+
+
+def test_paused_batch_is_rejected_even_when_members_invalid(client: TestClient) -> None:
+    # 暂停门禁优先于成员门禁：即使成员本来会失败（未完成 / 不存在），
+    # 暂停期间整批统一返回 experiment_paused，避免借批量结果探测安排
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+    assert pause_experiment(client, eid, "pause-1", "hold").status_code == 200
+
+    batch = client.post(
+        f"/experiments/{eid}/advance-batch",
+        json={
+            "batch_id": "b-held",
+            "members": [
+                {"subject_id": "s1", "expected_period": 2},   # 上一周期未完成
+                {"subject_id": "ghost", "expected_period": 1},  # 不存在
+            ],
+        },
+    )
+    assert batch.status_code == 409
+    assert batch.json()["detail"]["reason"] == "experiment_paused"
+    assert "failures" not in batch.json()["detail"]
+    assert_no_sequence_leak(batch.json())
+
+
+def test_paused_failed_advance_does_not_consume_request_id(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "pause-1", "hold").status_code == 200
+
+    payload = {"subject_id": "s1", "expected_period": 1, "request_id": "held-r"}
+    blocked = client.post(f"/experiments/{eid}/advance", json=payload)
+    assert blocked.status_code == 409
+
+    assert resume_experiment(client, eid, "resume-1", expected_version=2).status_code == 200
+    ok = client.post(f"/experiments/{eid}/advance", json=payload)
+    assert ok.status_code == 200
+    assert ok.json()["request_id"] == "held-r"
+
+
+def test_resume_expected_version_conflict_returns_409(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "pause-1", "hold").status_code == 200
+
+    # 过期 / 超前的期望版本均被拒绝
+    for wrong_version in (1, 3):
+        resp = resume_experiment(client, eid, f"resume-bad-{wrong_version}", wrong_version)
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "state_version_conflict"
+        assert detail["status"] == "paused"
+        assert detail["version"] == 2
+        assert detail["expected_version"] == wrong_version
+
+    # 版本冲突不改变状态：暂停仍然生效
+    blocked = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "still-held"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+    # 版本冲突不消耗 operation_id：换成正确版本后同键首次成功
+    ok = resume_experiment(client, eid, "resume-bad-1", expected_version=2)
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "active"
+    assert ok.json()["version"] == 3
+
+
+def test_pause_operation_id_is_idempotent_and_replays_first_result(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    payload = {"operation_id": "op-1", "reason": "原因甲"}
+
+    first = client.post(f"/experiments/{eid}/pause", json=payload)
+    assert first.status_code == 200
+    first_body = first.json()
+    for _ in range(2):
+        replay = client.post(f"/experiments/{eid}/pause", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == first_body
+
+    # 暂停 -> 恢复 -> 再暂停后，用旧 operation_id 重放仍返回首次暂停结果
+    assert resume_experiment(client, eid, "resume-1", expected_version=2).status_code == 200
+    assert pause_experiment(client, eid, "pause-2", "原因乙").status_code == 200
+    replay = client.post(f"/experiments/{eid}/pause", json=payload)
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+    # 重放不产生新的状态转换，版本仍停留在第二次暂停后的 4
+    assert replay.json()["version"] == 2
+    events = client.get(f"/experiments/{eid}/state-events").json()
+    assert [e["version"] for e in events] == [4, 3, 2]
+
+
+def test_resume_operation_id_is_idempotent(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "pause-1", "hold").status_code == 200
+
+    payload = {"operation_id": "resume-op", "expected_version": 2}
+    first = client.post(f"/experiments/{eid}/resume", json=payload)
+    assert first.status_code == 200
+    first_body = first.json()
+    # 即使活动状态下重放（此时状态机本应 not_paused），仍返回首次结果
+    replay = client.post(f"/experiments/{eid}/resume", json=payload)
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+
+
+def test_operation_id_reused_with_different_payload_returns_409(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "shared-op", "原因甲").status_code == 200
+
+    # 同一 operation_id、不同暂停原因
+    other_reason = pause_experiment(client, eid, "shared-op", "原因乙")
+    assert other_reason.status_code == 409
+    assert other_reason.json()["detail"]["reason"] == "operation_id_conflict"
+
+    # 同一 operation_id 跨操作类型（pause vs resume）
+    as_resume = resume_experiment(client, eid, "shared-op", expected_version=2)
+    assert as_resume.status_code == 409
+    assert as_resume.json()["detail"]["reason"] == "operation_id_conflict"
+
+    # resume 的 operation_id 绑定不同期望版本
+    other_version = resume_experiment(client, eid, "resume-x", expected_version=1)
+    assert other_version.status_code == 409  # 先撞版本冲突
+    assert resume_experiment(client, eid, "resume-x", expected_version=2).status_code == 200
+    conflict = resume_experiment(client, eid, "resume-x", expected_version=9)
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+
+
+def test_state_events_listed_newest_first_with_audit_fields(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    pause_experiment(client, eid, "p1", "原因一")
+    resume_experiment(client, eid, "r1", expected_version=2)
+    pause_experiment(client, eid, "p2", "原因二")
+    resume_experiment(client, eid, "r2", expected_version=4)
+
+    resp = client.get(f"/experiments/{eid}/state-events")
+    assert resp.status_code == 200
+    events = resp.json()
+    # 按时间（seq）倒序：新 -> 旧
+    assert [e["operation"] for e in events] == [
+        "resume", "pause", "resume", "pause"
+    ]
+    assert [e["version"] for e in events] == [5, 4, 3, 2]
+    assert [e["status"] for e in events] == [
+        "active", "paused", "active", "paused"
+    ]
+    assert [e["operation_id"] for e in events] == ["r2", "p2", "r1", "p1"]
+    assert [e["reason"] for e in events] == [
+        None, "原因二", None, "原因一"
+    ]
+    # seq 严格倒序且每条携带审计要素
+    seqs = [e["seq"] for e in events]
+    assert seqs == sorted(seqs, reverse=True)
+    for event in events:
+        assert event["experiment_id"] == eid
+        assert "changed_at" in event
+
+    # 分页：limit / offset
+    page = client.get(f"/experiments/{eid}/state-events?limit=2&offset=1").json()
+    assert [e["operation_id"] for e in page] == ["p2", "r1"]
+
+    # 没有状态变更的实验：审计为空（实验存在）
+    fresh, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["t1", "t2"],
+        seed=2,
+    )
+    empty = client.get(
+        f"/experiments/{fresh['experiment_id']}/state-events"
+    )
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+
+def test_state_events_invalid_pagination(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert client.get(f"/experiments/{eid}/state-events?limit=0").status_code == 422
+    assert client.get(f"/experiments/{eid}/state-events?limit=201").status_code == 422
+    assert client.get(f"/experiments/{eid}/state-events?offset=-1").status_code == 422
+
+
+def test_pause_resume_unknown_experiment_returns_404(client: TestClient) -> None:
+    assert pause_experiment(client, "missing", "op", "why").status_code == 404
+    assert resume_experiment(
+        client, "missing", "op", expected_version=1
+    ).status_code == 404
+    assert client.get("/experiments/missing/state-events").status_code == 404
+
+
+def test_pause_payload_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "", "reason": "x"},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "op", "reason": ""},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "op", "reason": "   "},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/pause",
+        json={"operation_id": "op", "reason": "x" * 501},
+    ).status_code == 422
+
+    assert client.post(
+        f"/experiments/{eid}/resume",
+        json={"operation_id": "", "expected_version": 1},
+    ).status_code == 422
+    assert client.post(
+        f"/experiments/{eid}/resume",
+        json={"operation_id": "op", "expected_version": 0},
+    ).status_code == 422
+
+    # 全部校验失败期间不产生状态变更
+    assert client.get(f"/experiments/{eid}/state-events").json() == []
+
+
+def test_concurrent_resume_has_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-state.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 31,
+            },
+        ).json()
+        eid = created["experiment_id"]
+        assert setup.post(
+            f"/experiments/{eid}/pause",
+            json={"operation_id": "pause-1", "reason": "hold"},
+        ).status_code == 200
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/resume",
+                json={
+                    "operation_id": f"resume-race-{i}",
+                    "expected_version": 2,
+                },
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：只有一次恢复成功，其余看到 not_paused
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+
+    with TestClient(app) as verify:
+        events = verify.get(f"/experiments/{eid}/state-events").json()
+    # 只有 pause + resume 两条审计：失败者不写入、不增版本
+    assert [(e["operation"], e["version"]) for e in events] == [
+        ("resume", 3),
+        ("pause", 2),
+    ]
+
+
+def test_startup_migrates_legacy_database_with_state_tables(
+    tmp_path, monkeypatch
+) -> None:
+    """旧库启动时自动补齐状态表后，暂停 / 恢复 / 审计可直接使用。"""
+    db_path = tmp_path / "legacy-state.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-state", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-state", "s0", 0, '["A","B"]'),
+        )
+
+    with TestClient(app) as migrated:
+        assert pause_experiment(
+            migrated, "legacy-state", "lp", "旧库暂停"
+        ).status_code == 200
+        blocked = migrated.post(
+            "/experiments/legacy-state/advance",
+            json={
+                "subject_id": "s0",
+                "expected_period": 1,
+                "request_id": "la1",
+            },
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+        assert resume_experiment(
+            migrated, "legacy-state", "lr", expected_version=2
+        ).status_code == 200
+        events = migrated.get(
+            "/experiments/legacy-state/state-events"
+        ).json()
+        assert [e["operation"] for e in events] == ["resume", "pause"]
+        assert events[1]["reason"] == "旧库暂停"
+
+        ok = migrated.post(
+            "/experiments/legacy-state/advance",
+            json={
+                "subject_id": "s0",
+                "expected_period": 1,
+                "request_id": "la1",
+            },
+        )
+        assert ok.status_code == 200
+

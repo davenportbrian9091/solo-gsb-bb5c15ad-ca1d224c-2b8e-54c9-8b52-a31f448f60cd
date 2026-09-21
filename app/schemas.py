@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
+
+# 实验状态：active 可正常揭盲；paused 暂停一切新的揭盲（幂等成功重放除外）
+ExperimentStatus = Literal["active", "paused"]
+# 状态变更操作类型
+StateOperation = Literal["pause", "resume"]
 
 
 class ExperimentCreate(BaseModel):
@@ -169,3 +176,66 @@ class ProgressOut(BaseModel):
     completed: bool
     next_available_at: str | None = None
     reveals: list[RevealOut]
+
+
+class PauseRequest(BaseModel):
+    """实验暂停请求。"""
+
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="调用方生成的唯一操作键（如 UUID），相同 operation_id 重放返回首次结果",
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="暂停原因（必填，去首尾空白后非空，最长 500 字），写入审计记录",
+    )
+
+    @model_validator(mode="after")
+    def _reason_must_not_be_blank(self) -> "PauseRequest":
+        if not self.reason.strip():
+            raise ValueError("reason 不能为空白字符串")
+        return self
+
+
+class ResumeRequest(BaseModel):
+    """实验恢复请求：携带调用方持有的状态版本做原子乐观校验。"""
+
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="调用方生成的唯一操作键（如 UUID），相同 operation_id 重放返回首次结果",
+    )
+    expected_version: int = Field(
+        ...,
+        ge=1,
+        description="调用方认为当前（暂停）状态版本；与服务端不一致时返回 409 且不改变状态",
+    )
+
+
+class ExperimentStateOut(BaseModel):
+    """暂停 / 恢复的状态变更结果（也是幂等重放的首次结果）。"""
+
+    experiment_id: str
+    status: ExperimentStatus
+    # 每次成功的暂停 / 恢复状态转换递增 1；初始活动状态版本为 1
+    version: int
+    operation_id: str
+    reason: str | None = None
+    changed_at: str
+
+
+class StateEventOut(BaseModel):
+    """一条状态变更审计记录（暂停携带原因，恢复原因为 null）。"""
+
+    seq: int
+    experiment_id: str
+    operation: StateOperation
+    status: ExperimentStatus
+    version: int
+    operation_id: str
+    reason: str | None = None
+    changed_at: str
+

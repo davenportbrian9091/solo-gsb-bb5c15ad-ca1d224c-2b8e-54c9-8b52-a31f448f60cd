@@ -27,8 +27,12 @@ from .schemas import (
     CompleteRequest,
     ExperimentCreate,
     ExperimentOut,
+    ExperimentStateOut,
     ExperimentSummary,
+    PauseRequest,
     ProgressOut,
+    ResumeRequest,
+    StateEventOut,
 )
 from .williams import group_size, williams_sequences
 
@@ -43,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -195,6 +199,15 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
                 "request_id": payload.request_id,
             },
         )
+    except db.ExperimentPausedError:
+        # 实验暂停：拒绝一切新揭盲，只说明状态，不附带任何周期 / 条件信息
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "实验已暂停，暂停期间不能推进揭盲",
+                "reason": "experiment_paused",
+            },
+        )
     except db.StalePeriodError as exc:
         # 并发抢先推进或过期周期：不揭露任何条件
         raise HTTPException(
@@ -263,6 +276,16 @@ def advance_batch(experiment_id: str, payload: AdvanceBatchRequest) -> dict:
             detail={
                 "message": "batch_id 已被成员或周期不同的其他请求占用",
                 "reason": "batch_id_conflict",
+                "batch_id": payload.batch_id,
+            },
+        )
+    except db.ExperimentPausedError:
+        # 实验暂停：整批拒绝且零写入，只说明状态，不附带任何周期 / 条件信息
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "实验已暂停，暂停期间不能批量推进揭盲",
+                "reason": "experiment_paused",
                 "batch_id": payload.batch_id,
             },
         )
@@ -355,3 +378,107 @@ def get_progress(experiment_id: str, subject_id: str) -> dict:
             },
         )
     return progress
+
+
+def _state_conflict(exc: db.InvalidStateTransitionError) -> HTTPException:
+    """把暂停 / 恢复的状态机冲突统一翻译为不泄露安排的 409。"""
+    messages = {
+        "already_paused": "实验已处于暂停状态，无需重复暂停",
+        "not_paused": "实验当前未暂停，不能恢复",
+        "state_version_conflict": (
+            "expected_version 与实验当前状态版本不一致（状态已被其他操作变更）"
+        ),
+    }
+    detail: dict = {
+        "message": messages[exc.reason],
+        "reason": exc.reason,
+        "status": exc.status,
+        "version": exc.version,
+    }
+    if exc.expected_version is not None:
+        detail["expected_version"] = exc.expected_version
+    return HTTPException(status_code=409, detail=detail)
+
+
+@app.post(
+    "/experiments/{experiment_id}/pause",
+    response_model=ExperimentStateOut,
+    summary=(
+        "暂停实验：暂停期间单条与批量揭盲一律 409（幂等成功重放除外），"
+        "携带唯一 operation_id 与暂停原因"
+    ),
+)
+def pause_experiment(experiment_id: str, payload: PauseRequest) -> dict:
+    try:
+        result = db.change_experiment_state(
+            experiment_id,
+            operation="pause",
+            operation_id=payload.operation_id,
+            reason=payload.reason.strip(),
+        )
+    except db.OperationIdConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被操作或原因不同的其他请求占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    except db.InvalidStateTransitionError as exc:
+        raise _state_conflict(exc)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return result
+
+
+@app.post(
+    "/experiments/{experiment_id}/resume",
+    response_model=ExperimentStateOut,
+    summary="恢复实验：expected_version 必须等于当前暂停版本，事务内原子校验",
+)
+def resume_experiment(experiment_id: str, payload: ResumeRequest) -> dict:
+    try:
+        result = db.change_experiment_state(
+            experiment_id,
+            operation="resume",
+            operation_id=payload.operation_id,
+            expected_version=payload.expected_version,
+        )
+    except db.OperationIdConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被操作或期望版本不同的其他请求占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    except db.InvalidStateTransitionError as exc:
+        raise _state_conflict(exc)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return result
+
+
+@app.get(
+    "/experiments/{experiment_id}/state-events",
+    response_model=list[StateEventOut],
+    summary="查询实验暂停 / 恢复审计流水（按时间倒序，支持分页）",
+)
+def list_state_events(
+    experiment_id: str, limit: int = 50, offset: int = 0
+) -> list[dict]:
+    # 与其他列表接口一致在入口处约束分页参数
+    if not 1 <= limit <= 200:
+        raise HTTPException(
+            status_code=422, detail="limit 必须在 1～200 之间"
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset 不能为负数")
+    events = db.list_state_events(experiment_id, limit=limit, offset=offset)
+    if events is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return events

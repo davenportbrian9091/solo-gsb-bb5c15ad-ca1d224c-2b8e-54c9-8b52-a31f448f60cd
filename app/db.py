@@ -17,6 +17,12 @@
   幂等结果，按 ``(实验, request_id)`` 去重。
 * ``advance_batches``：批量受控揭盲的幂等结果，按 ``(实验, batch_id)``
   去重，保存首次请求绑定的有序成员列表与首次揭盲结果。
+* ``experiment_state``：实验级运行状态（``active`` / ``paused``）与单调
+  递增的状态版本号，暂停期间拒绝一切新的揭盲；
+* ``state_operations``：暂停 / 恢复操作按 ``(实验, operation_id)``
+  去重，保存首次结果以支持重放；
+* ``state_events``：暂停 / 恢复状态变更的审计流水，自增 ``seq`` 保证
+  同一时刻的事件也能稳定地按时间倒序查询。
 """
 
 from __future__ import annotations
@@ -108,6 +114,40 @@ CREATE TABLE IF NOT EXISTS advance_batches (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (experiment_id, batch_id)
 );
+
+CREATE TABLE IF NOT EXISTS experiment_state (
+    experiment_id TEXT PRIMARY KEY REFERENCES experiments(id),
+    status        TEXT NOT NULL,         -- active（初始）/ paused
+    version       INTEGER NOT NULL,      -- 每次成功状态转换 +1，初始 1
+    reason        TEXT,                  -- 最近一次暂停原因（仅暂停时非空）
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS state_operations (
+    experiment_id  TEXT NOT NULL REFERENCES experiments(id),
+    operation_id   TEXT NOT NULL,
+    operation      TEXT NOT NULL,        -- pause / resume（首次操作绑定）
+    expected_version INTEGER,            -- resume 首次请求绑定的期望版本（pause 为 NULL）
+    status         TEXT NOT NULL,        -- 首次结果状态
+    version        INTEGER NOT NULL,     -- 首次结果版本
+    reason         TEXT,                 -- 首次暂停原因（resume 为 NULL）
+    changed_at     TEXT NOT NULL,
+    PRIMARY KEY (experiment_id, operation_id)
+);
+
+CREATE TABLE IF NOT EXISTS state_events (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,  -- 自增序号，保证同刻事件排序稳定
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    operation     TEXT NOT NULL,        -- pause / resume
+    status        TEXT NOT NULL,        -- 变更后的状态
+    version       INTEGER NOT NULL,     -- 变更后的版本
+    operation_id  TEXT NOT NULL,
+    reason        TEXT,                 -- 暂停原因；恢复为 NULL
+    changed_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_events_experiment
+    ON state_events (experiment_id, seq);
 """
 
 
@@ -172,6 +212,37 @@ class BatchMembersRejectedError(Exception):
     def __init__(self, failures: list[dict[str, Any]]) -> None:
         self.failures = failures
         super().__init__(f"batch members rejected: {len(failures)} failure(s)")
+
+
+class ExperimentPausedError(Exception):
+    """实验处于暂停状态：拒绝一切新的揭盲。
+
+    故意不携带任何周期 / 条件信息，避免在暂停期间泄露实验安排。
+    """
+
+
+class OperationIdConflictError(Exception):
+    """operation_id 已被操作类型或载荷不同的另一次状态变更占用。"""
+
+
+class InvalidStateTransitionError(Exception):
+    """暂停 / 恢复状态转换不合法（状态不符或期望版本过期）。
+
+    :param reason: ``already_paused`` / ``not_paused`` /
+        ``state_version_conflict``。
+    """
+
+    def __init__(
+        self, reason: str, status: str, version: int, expected_version: int | None
+    ) -> None:
+        self.reason = reason
+        self.status = status
+        self.version = version
+        self.expected_version = expected_version
+        super().__init__(
+            f"invalid state transition: reason={reason}, "
+            f"status={status}, version={version}"
+        )
 
 
 def utc_now() -> datetime:
@@ -319,6 +390,15 @@ def _get_washout(conn: sqlite3.Connection, experiment_id: str) -> int | None:
     return None if row is None else int(row["washout_seconds"])
 
 
+def _get_status_locked(conn: sqlite3.Connection, experiment_id: str) -> str:
+    """读取实验当前状态；无状态行（旧实验、从未变更）视为 active。"""
+    row = conn.execute(
+        "SELECT status FROM experiment_state WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    return "active" if row is None else row["status"]
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -352,6 +432,11 @@ def _advance_locked(
     washout = _get_washout(conn, experiment_id)
     if washout is None:
         return None
+
+    # 暂停门禁：暂停期间拒绝一切新揭盲。幂等命中已在上方先行返回，
+    # 因此暂停前的成功请求重放仍取首次结果，不被暂停拦截。
+    if _get_status_locked(conn, experiment_id) == "paused":
+        raise ExperimentPausedError()
 
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
@@ -527,6 +612,11 @@ def _advance_batch_locked(
     washout = _get_washout(conn, experiment_id)
     if washout is None:
         return None
+
+    # 暂停门禁：暂停期间整批拒绝（零写入）。batch_id 幂等命中已在上方
+    # 先行返回，因此暂停前的成功批次重放仍取首次结果。
+    if _get_status_locked(conn, experiment_id) == "paused":
+        raise ExperimentPausedError()
 
     # 一次取齐全部成员的序列与进度（同一事务快照，期间无其他写入）
     subject_ids = [m["subject_id"] for m in members]
@@ -903,6 +993,224 @@ def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
             for row in reveal_rows
         ],
     }
+
+
+def change_experiment_state(
+    experiment_id: str,
+    operation: str,
+    operation_id: str,
+    reason: str | None = None,
+    expected_version: int | None = None,
+) -> dict[str, Any] | None:
+    """原子地暂停或恢复一个实验，并写入操作幂等记录与审计流水。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(experiment_id, operation_id)`` 已存在时返回首次结果；
+       同一 operation_id 绑定不同操作类型（pause/resume）、不同暂停原因或
+       不同期望版本时抛出 :class:`OperationIdConflictError`；
+    2. 实验必须存在，否则返回 ``None``（404）；
+    3. 状态机校验：
+       * ``pause`` 仅在 ``active`` 时成功；已经处于暂停时抛出
+         :class:`InvalidStateTransitionError`（``already_paused``）；
+       * ``resume`` 仅在 ``paused`` 且 ``expected_version`` 等于当前版本时
+         成功；非暂停状态抛出 ``not_paused``，版本落后 / 超前抛出
+         ``state_version_conflict``；
+    4. 变更：状态版本 ``version`` 递增 1，写入 / 更新 ``experiment_state``、
+       追加 ``state_events`` 审计流水、落盘 ``state_operations`` 幂等结果，
+       三者一起提交或一起回滚。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _change_state_locked(
+                conn,
+                experiment_id,
+                operation,
+                operation_id,
+                reason,
+                expected_version,
+            )
+            if result is not None and not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            if result is not None:
+                result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _change_state_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    operation: str,
+    operation_id: str,
+    reason: str | None,
+    expected_version: int | None,
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：操作类型与首次载荷一致才返回首次结果，否则 409
+    op_row = conn.execute(
+        "SELECT operation, expected_version, status, version, reason, changed_at "
+        "FROM state_operations WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if op_row is not None:
+        if (
+            op_row["operation"] != operation
+            or op_row["reason"] != reason
+            or op_row["expected_version"] != expected_version
+        ):
+            raise OperationIdConflictError()
+        return {
+            "experiment_id": experiment_id,
+            "status": op_row["status"],
+            "version": op_row["version"],
+            "operation_id": operation_id,
+            "reason": op_row["reason"],
+            "changed_at": op_row["changed_at"],
+            "_replayed": True,
+        }
+
+    # 2) 实验必须存在
+    experiment_row = conn.execute(
+        "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    if experiment_row is None:
+        return None
+
+    state_row = conn.execute(
+        "SELECT status, version, reason FROM experiment_state "
+        "WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    current_status = "active" if state_row is None else state_row["status"]
+    current_version = 1 if state_row is None else int(state_row["version"])
+
+    # 3) 状态机与期望版本校验（失败路径不写入任何数据）
+    if operation == "pause":
+        if current_status == "paused":
+            raise InvalidStateTransitionError(
+                reason="already_paused",
+                status=current_status,
+                version=current_version,
+                expected_version=None,
+            )
+        new_status = "paused"
+        new_reason = reason
+    else:  # resume
+        if current_status != "paused":
+            raise InvalidStateTransitionError(
+                reason="not_paused",
+                status=current_status,
+                version=current_version,
+                expected_version=expected_version,
+            )
+        if expected_version != current_version:
+            raise InvalidStateTransitionError(
+                reason="state_version_conflict",
+                status=current_status,
+                version=current_version,
+                expected_version=expected_version,
+            )
+        new_status = "active"
+        new_reason = None
+
+    new_version = current_version + 1
+    changed_at = utc_now().isoformat()
+
+    # 4) 状态、审计流水、幂等结果在同一事务内落盘
+    conn.execute(
+        "INSERT INTO experiment_state "
+        "(experiment_id, status, version, reason, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(experiment_id) DO UPDATE SET "
+        "status = excluded.status, version = excluded.version, "
+        "reason = excluded.reason, updated_at = excluded.updated_at",
+        (experiment_id, new_status, new_version, new_reason, changed_at),
+    )
+    conn.execute(
+        "INSERT INTO state_events "
+        "(experiment_id, operation, status, version, operation_id, "
+        "reason, changed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            operation,
+            new_status,
+            new_version,
+            operation_id,
+            new_reason,
+            changed_at,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO state_operations "
+        "(experiment_id, operation_id, operation, expected_version, "
+        "status, version, reason, changed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            operation_id,
+            operation,
+            expected_version,
+            new_status,
+            new_version,
+            new_reason,
+            changed_at,
+        ),
+    )
+
+    return {
+        "experiment_id": experiment_id,
+        "status": new_status,
+        "version": new_version,
+        "operation_id": operation_id,
+        "reason": new_reason,
+        "changed_at": changed_at,
+        "_replayed": False,
+    }
+
+
+def list_state_events(
+    experiment_id: str, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]] | None:
+    """按时间倒序（新 → 旧）查询实验状态变更审计记录。
+
+    以自增 ``seq`` 排序，保证同一时刻发生的事件顺序也稳定；
+    实验不存在时返回 ``None``。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        rows = conn.execute(
+            "SELECT seq, experiment_id, operation, status, version, "
+            "operation_id, reason, changed_at FROM state_events "
+            "WHERE experiment_id = ? ORDER BY seq DESC LIMIT ? OFFSET ?",
+            (experiment_id, limit, offset),
+        ).fetchall()
+    return [
+        {
+            "seq": row["seq"],
+            "experiment_id": row["experiment_id"],
+            "operation": row["operation"],
+            "status": row["status"],
+            "version": row["version"],
+            "operation_id": row["operation_id"],
+            "reason": row["reason"],
+            "changed_at": row["changed_at"],
+        }
+        for row in rows
+    ]
 
 
 def get_experiment(experiment_id: str) -> dict[str, Any] | None:
